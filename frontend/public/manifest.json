@@ -1,0 +1,25 @@
+{
+  "short_name": "YT Translator",
+  "name": "YT Video Translator",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0d0e15",
+  "theme_color": "#0d0e15",
+  "display": "standalone",
+  "orientation": "any",
+  "share_target": {
+    "action": "/",
+    "method": "GET",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  }
+}
