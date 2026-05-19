@@ -137,8 +137,8 @@ const uiTranslations = {
     emptySubtitles: "No subtitle transcripts generated for this audio segment."
   }
 };
-// Centralized production backend API URL. Replace this with your live Render.com / Cloud URL.
-const DEFAULT_PRODUCTION_API_URL = 'https://ai-video-translator-backend.onrender.com';
+// Centralized production backend API URL. Leave as empty string for relative paths, or set your Firebase URL (e.g., https://your-project.web.app).
+const DEFAULT_PRODUCTION_API_URL = '';
 
 export default function App() {
   const [url, setUrl] = useState('');

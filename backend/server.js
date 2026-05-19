@@ -3,10 +3,17 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { GoogleAIFileManager } = require('@google/generative-ai/files');
 const { YoutubeTranscript } = require('youtube-transcript');
 const ytdl = require('@distube/ytdl-core');
+
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+if (admin.apps.length === 0) {
+  admin.initializeApp();
+}
 
 // Watcher reload trigger active
 
@@ -28,14 +35,16 @@ if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const fileManager = new GoogleAIFileManager(GEMINI_API_KEY);
 
+const isServerless = !!(process.env.FUNCTION_SIGNATURE_TYPE || process.env.FIREBASE_CONFIG);
+
 // Create temp directory for audio downloads
-const tempDir = path.join(__dirname, 'temp');
+const tempDir = isServerless ? path.join(os.tmpdir(), 'temp') : path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir, { recursive: true });
 }
 
 // Lightning-Fast Translation Cache System (Persistent Disk Cache)
-const CACHE_FILE = path.join(__dirname, 'translation_cache.json');
+const CACHE_FILE = isServerless ? path.join(os.tmpdir(), 'translation_cache.json') : path.join(__dirname, 'translation_cache.json');
 let translationCache = {};
 
 try {
@@ -562,7 +571,7 @@ app.post('/api/feedback', async (req, res) => {
   };
 
   try {
-    const feedbackFile = path.join(__dirname, 'feedbacks.json');
+    const feedbackFile = isServerless ? path.join(os.tmpdir(), 'feedbacks.json') : path.join(__dirname, 'feedbacks.json');
     let feedbacks = [];
     if (fs.existsSync(feedbackFile)) {
       feedbacks = JSON.parse(fs.readFileSync(feedbackFile, 'utf8'));
@@ -590,12 +599,20 @@ app.get('/api/health', (req, res) => {
 });
 
 // Start Express Server
-app.listen(PORT, () => {
-  console.log(`==================================================`);
-  console.log(` AI Video Translator Backend is running!`);
-  console.log(` Port: ${PORT}`);
-  console.log(` Endpoint: http://localhost:${PORT}/api/process`);
-  console.log(`==================================================`);
-});
+if (!isServerless) {
+  app.listen(PORT, () => {
+    console.log(`==================================================`);
+    console.log(` AI Video Translator Backend is running!`);
+    console.log(` Port: ${PORT}`);
+    console.log(` Endpoint: http://localhost:${PORT}/api/process`);
+    console.log(`==================================================`);
+  });
+}
+
+// Export the Express app wrapped in Firebase Cloud Functions
+exports.api = functions.runWith({
+  timeoutSeconds: 300,
+  memory: '1GB'
+}).https.onRequest(app);
 
 // Trigger restart: Port 5005 freed successfully
