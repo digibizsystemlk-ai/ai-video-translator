@@ -137,6 +137,8 @@ const uiTranslations = {
     emptySubtitles: "No subtitle transcripts generated for this audio segment."
   }
 };
+// Centralized production backend API URL. Replace this with your live Render.com / Cloud URL.
+const DEFAULT_PRODUCTION_API_URL = 'https://ai-video-translator-backend.onrender.com';
 
 export default function App() {
   const [url, setUrl] = useState('');
@@ -168,7 +170,7 @@ export default function App() {
   const [tempSubtitleSize, setTempSubtitleSize] = useState(subtitleSize);
 
   const [apiBase, setApiBase] = useState(() => {
-    return localStorage.getItem('yt_translator_api_base') || '';
+    return localStorage.getItem('yt_translator_api_base') || DEFAULT_PRODUCTION_API_URL;
   });
   const [tempApiBase, setTempApiBase] = useState(apiBase);
 
@@ -607,30 +609,6 @@ export default function App() {
                 </select>
               </div>
 
-              {/* Server API Base Setting */}
-              <div style={{ marginBottom: '1.25rem' }}>
-                <label style={{ display: 'block', fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)', marginBottom: '0.6rem' }}>
-                  <i className="fa-solid fa-server" style={{ color: 'var(--accent-pink)', marginRight: '0.5rem' }}></i>
-                  {tempLang === 'Sinhala' ? 'Backend Server API Base (බාහිර සේවාදායක ලිපිනය)' : 'Backend Server API Base'}
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. http://192.168.1.100:5005 (Leave blank for default local)"
-                  value={tempApiBase}
-                  onChange={(e) => setTempApiBase(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '0.9rem 1.2rem',
-                    background: 'rgba(255,255,255,0.04)',
-                    border: '1px solid rgba(255,255,255,0.08)',
-                    borderRadius: '12px',
-                    color: 'var(--text-primary)',
-                    fontSize: '1rem',
-                    outline: 'none',
-                    fontFamily: 'monospace'
-                  }}
-                />
-              </div>
 
               <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem', lineHeight: '1.4' }}>
                 * Saved settings will persist. We'll automatically translate all future videos and apply your selected settings.

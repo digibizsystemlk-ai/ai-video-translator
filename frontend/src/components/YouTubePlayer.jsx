@@ -17,7 +17,6 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
         if (screen.orientation && typeof screen.orientation.unlock === 'function') {
           screen.orientation.unlock();
         }
-        setHasStarted(false);
       }
     };
     document.addEventListener('fullscreenchange', handleFsChange);
@@ -53,23 +52,37 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
     setHasStarted(true);
   };
 
+  const [isFallbackFullscreen, setIsFallbackFullscreen] = useState(false);
+
   const handleFullscreenToggle = () => {
     const wrapper = wrapperRef.current;
     if (wrapper) {
-      if (!document.fullscreenElement) {
-        wrapper.requestFullscreen().catch(err => {
-          console.error("Error entering fullscreen:", err);
-        });
+      if (typeof wrapper.requestFullscreen === 'function') {
+        if (!document.fullscreenElement) {
+          wrapper.requestFullscreen().then(() => {
+            setIsFallbackFullscreen(false);
+          }).catch(err => {
+            console.warn("Native fullscreen rejected, triggering fallback:", err);
+            setIsFallbackFullscreen(prev => !prev);
+          });
+        } else {
+          document.exitFullscreen().then(() => {
+            setIsFallbackFullscreen(false);
+          }).catch(err => {
+            console.error("Error exiting fullscreen:", err);
+          });
+        }
       } else {
-        document.exitFullscreen().catch(err => {
-          console.error("Error exiting fullscreen:", err);
-        });
+        // Fallback for iOS Safari which doesn't support requestFullscreen
+        setIsFallbackFullscreen(prev => !prev);
       }
     }
   };
 
   useEffect(() => {
     if (!videoId) return;
+
+    setHasStarted(false);
 
     let playerInstance = null;
 
@@ -177,9 +190,9 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
   }, [seekTrigger]);
 
   return (
-    <div ref={wrapperRef} className="player-wrapper" onDoubleClick={handleFullscreenToggle}>
+    <div ref={wrapperRef} className={`player-wrapper ${isFallbackFullscreen ? 'fallback-fullscreen' : ''}`} onDoubleClick={handleFullscreenToggle}>
+      {/* React-controlled wrapper to safely apply visibility styles without YouTube API iframe replacement interference */}
       <div 
-        ref={containerRef} 
         style={{ 
           width: '100%', 
           height: '100%',
@@ -187,7 +200,9 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
           pointerEvents: hasStarted ? 'auto' : 'none',
           transition: 'opacity 0.3s ease'
         }}
-      ></div>
+      >
+        <div ref={containerRef} style={{ width: '100%', height: '100%' }}></div>
+      </div>
       
       {/* Custom Fullscreen Toggle Button */}
       {hasStarted && (

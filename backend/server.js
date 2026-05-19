@@ -189,6 +189,71 @@ function combineCaptions(rawCaptions, maxDuration = 12) {
 }
 
 /**
+ * Completely keyless, free, and unlimited Google Translate API fallback (Super Fast Batch Mode)
+ */
+async function translateTextFree(texts, targetLang = 'Sinhala') {
+  const langCodes = {
+    'Sinhala': 'si',
+    'English': 'en',
+    'Tamil': 'ta',
+    'Hindi': 'hi',
+    'Spanish': 'es',
+    'German': 'de',
+    'French': 'fr'
+  };
+  const tl = langCodes[targetLang] || 'si';
+  
+  console.log(`[Free Translator] Super Fast Batch translating ${texts.length} segments to lang code: ${tl}...`);
+  const translations = [];
+  const batchSize = 8; // Safely sized batch to prevent HTTP 400/URL length limits
+  
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const chunk = texts.slice(i, i + batchSize);
+    const joinedText = chunk.join('\n');
+    
+    try {
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${tl}&dt=t&q=${encodeURIComponent(joinedText)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+      const data = await res.json();
+      
+      let translatedLines = [];
+      if (data && data[0]) {
+        const combinedTranslation = data[0].map(x => x[0]).join('');
+        translatedLines = combinedTranslation.split('\n').map(line => line.trim());
+      }
+      
+      // Robust split validation
+      if (translatedLines.length === chunk.length) {
+        translations.push(...translatedLines);
+        console.log(`[Free Translator] Translated batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(texts.length / batchSize)} successfully.`);
+      } else {
+        console.warn(`[Free Translator Warning] Split mismatch on batch ${Math.floor(i / batchSize) + 1}. Sequential fallback...`);
+        for (const line of chunk) {
+          try {
+            const singleUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${tl}&dt=t&q=${encodeURIComponent(line)}`;
+            const singleRes = await fetch(singleUrl);
+            const singleData = await singleRes.json();
+            const translatedSingle = singleData[0].map(x => x[0]).join('').trim();
+            translations.push(translatedSingle || line);
+          } catch (e) {
+            translations.push(line);
+          }
+          await new Promise(r => setTimeout(r, 20));
+        }
+      }
+    } catch (err) {
+      console.error(`[Free Translator Error] Failed batch starting at index ${i}:`, err);
+      translations.push(...chunk); // Safe fallback to original
+    }
+    
+    // Tiny delay between small batches to protect rate limits while maintaining ultra-high speed
+    await new Promise(r => setTimeout(r, 20));
+  }
+  return translations;
+}
+
+/**
  * Main Processing API endpoint
  * GET /api/process?url=...&lang=...
  */
@@ -232,12 +297,18 @@ app.get('/api/process', async (req, res) => {
       const transcriptList = await YoutubeTranscript.fetchTranscript(videoId);
       
       if (transcriptList && transcriptList.length > 0) {
-        rawCaptions = transcriptList.map(item => ({
-          start: Number((item.offset / 1000).toFixed(2)),
-          end: Number(((item.offset + item.duration) / 1000).toFixed(2)),
-          text: item.text
-        }));
-        console.log(`[Processor] Successfully fetched ${rawCaptions.length} native caption segments.`);
+        rawCaptions = transcriptList
+          .map(item => {
+            // Strip sound/music descriptors in brackets or parentheses like [Music], (Laughter), [संगीत]
+            const cleanedText = item.text.replace(/\[[^\]]*\]|\([^)]*\)/g, '').trim();
+            return {
+              start: Number((item.offset / 1000).toFixed(2)),
+              end: Number(((item.offset + item.duration) / 1000).toFixed(2)),
+              text: cleanedText
+            };
+          })
+          .filter(item => item.text.length > 0); // Filter out empty segments (e.g. music-only segments)
+        console.log(`[Processor] Successfully fetched and cleaned ${rawCaptions.length} native caption segments.`);
       }
     } catch (err) {
       console.log(`[Processor] Native captions fetching failed or not available: ${err.message}`);
@@ -391,7 +462,7 @@ You MUST return a single JSON object strictly matching the required JSON schema 
       };
 
       const translatePrompt = `You are a premium, professional video translator.
-Translate the following array of English subtitle text strings into ${lang} in the exact same 1-to-1 order.
+Translate the following array of video subtitle text strings (which may be in English, Hindi, Spanish, or any other source language) into ${lang} in the exact same 1-to-1 order.
 Do not omit any items. Maintain the exact same number of elements in the output list.
 
 Input Texts Array:
@@ -413,6 +484,15 @@ You MUST return a single JSON object matching this schema:
         } catch (err) {
           console.error(`[Processor] Error parsing translations:`, err);
           return allTexts; // Fallback to original text if parse fails
+        }
+      }).catch(async (err) => {
+        console.warn(`[Processor Warning] Gemini Translation failed: ${err.message}. Toggling Free Keyless Translation Fallback!`);
+        methodUsed = 'Free Keyless Google Translation Fallback';
+        try {
+          return await translateTextFree(allTexts, lang);
+        } catch (freeErr) {
+          console.error(`[Processor ERROR] Free translation fallback failed:`, freeErr);
+          return allTexts; // Fallback to original text
         }
       });
 
