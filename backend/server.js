@@ -341,6 +341,10 @@ app.get('/api/process', async (req, res) => {
         'Sec-Ch-Ua-Platform': '"Windows"',
       };
 
+      if (process.env.YOUTUBE_COOKIE) {
+        chromeHeaders['cookie'] = process.env.YOUTUBE_COOKIE;
+      }
+
       const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
         requestOptions: { headers: chromeHeaders }
       });
