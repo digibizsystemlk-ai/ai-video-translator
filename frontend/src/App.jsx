@@ -138,7 +138,7 @@ const uiTranslations = {
   }
 };
 // Centralized production backend API URL. Leave as empty string for relative paths, or set your Firebase URL (e.g., https://your-project.web.app).
-const DEFAULT_PRODUCTION_API_URL = '';
+const DEFAULT_PRODUCTION_API_URL = 'https://digibiz-apps.web.app';
 
 export default function App() {
   const [url, setUrl] = useState('');

@@ -10,6 +10,7 @@ const { YoutubeTranscript } = require('youtube-transcript');
 const ytdl = require('@distube/ytdl-core');
 
 const functions = require('firebase-functions');
+const { onRequest } = require('firebase-functions/v2/https');
 const admin = require('firebase-admin');
 if (admin.apps.length === 0) {
   admin.initializeApp();
@@ -609,10 +610,10 @@ if (!isServerless) {
   });
 }
 
-// Export the Express app wrapped in Firebase Cloud Functions
-exports.api = functions.runWith({
+// Export the Express app wrapped in Firebase Cloud Functions (2nd Gen)
+exports.translator = onRequest({
   timeoutSeconds: 300,
-  memory: '1GB'
-}).https.onRequest(app);
+  memory: '1GiB'
+}, app);
 
 // Trigger restart: Port 5005 freed successfully
