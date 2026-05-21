@@ -1,165 +1,291 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { GoogleAIFileManager } = require('@google/generative-ai/files');
+const { execFile } = require('child_process');
 const { YoutubeTranscript } = require('youtube-transcript');
-const ytdl = require('@distube/ytdl-core');
+const axios = require('axios');
+const FormData = require('form-data');
+const { ProxyAgent } = require('undici');
 
-const functions = require('firebase-functions');
-const { onRequest } = require('firebase-functions/v2/https');
-const admin = require('firebase-admin');
-if (admin.apps.length === 0) {
-  admin.initializeApp();
-}
-
-// Watcher reload trigger active
-
-// Load environment variables
 dotenv.config();
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-app.use(cors());
-app.use(express.json());
-
-// Initialize Gemini API
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
-  console.warn('WARNING: Google Gemini API Key is not set or contains default placeholder. Please update it in the backend/.env file.');
+// Initialize ProxyAgent for global fetch if proxy environment variables are set
+let proxyUrl = process.env.PROXY_URL;
+if (!proxyUrl && process.env.PROXY_HOST) {
+  const host = process.env.PROXY_HOST;
+  const port = process.env.PROXY_PORT || '80';
+  const user = process.env.PROXY_USER;
+  const pass = process.env.PROXY_PASS;
+  if (user && pass) {
+    proxyUrl = `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+  } else {
+    proxyUrl = `http://${host}:${port}`;
+  }
 }
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const fileManager = new GoogleAIFileManager(GEMINI_API_KEY);
+let fetchConfig = {};
 
-const isServerless = !!(process.env.FUNCTION_SIGNATURE_TYPE || process.env.FIREBASE_CONFIG);
-
-// Create temp directory for audio downloads
-const tempDir = isServerless ? path.join(os.tmpdir(), 'temp') : path.join(__dirname, 'temp');
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir, { recursive: true });
-}
-
-// Lightning-Fast Translation Cache System (Persistent Disk Cache)
-const CACHE_FILE = isServerless ? path.join(os.tmpdir(), 'translation_cache.json') : path.join(__dirname, 'translation_cache.json');
-let translationCache = {};
+// 100% Free Browser Emulation Headers (Emulates Chrome on Windows to bypass YouTube Bot Detection)
+const EMULATION_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1'
+};
 
 try {
-  if (fs.existsSync(CACHE_FILE)) {
-    translationCache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    console.log(`[Cache] Loaded ${Object.keys(translationCache).length} cached translations from disk.`);
+  const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : null;
+  fetchConfig.fetch = (url, options) => {
+    const customHeaders = options && options.headers ? options.headers : {};
+    const mergedHeaders = {
+      ...EMULATION_HEADERS,
+      ...customHeaders
+    };
+    return fetch(url, {
+      ...options,
+      headers: mergedHeaders,
+      ...(dispatcher ? { dispatcher } : {})
+    });
+  };
+  if (proxyUrl) {
+    console.log(`🌐 [Proxy + Emulation] Configured undici ProxyAgent and browser headers for global transcript fetching.`);
+  } else {
+    console.log(`🌐 [Browser Emulation] Configured global browser spoofing headers for transcript fetching.`);
   }
 } catch (err) {
-  console.error('[Cache ERROR] Failed to load translation cache:', err);
+  console.error('❌ [Emulation ERROR] Failed to initialize fetch proxy/headers:', err.message);
+}
+
+const app = express();
+const PORT = 8080;
+
+app.use(cors());
+app.use(express.json({ limit: '15mb' }));
+
+// API Keys configuration
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyBMexKhvmMj_IpL9MB1iS1Q6tkhaVCDG4Q'; 
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+const isWindows = process.platform === 'win32';
+
+// In Firebase Cloud Functions, the environment filesystem is read-only, except for /tmp.
+const ytdlpPath = isWindows ? path.join(__dirname, 'yt-dlp.exe') : '/tmp/yt-dlp';
+const YTDLP_URL = isWindows 
+  ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' 
+  : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
+// Lightning-Fast Translation Cache System (Persistent Disk Cache)
+const READ_ONLY_CACHE_FILE = path.join(__dirname, 'translation_cache.json');
+const WRITE_CACHE_FILE = isWindows ? path.join(__dirname, 'translation_cache.json') : '/tmp/translation_cache.json';
+let translationCache = {};
+
+// 1. First, load the pre-packaged read-only cache from the bundle directory
+try {
+  if (fs.existsSync(READ_ONLY_CACHE_FILE)) {
+    translationCache = JSON.parse(fs.readFileSync(READ_ONLY_CACHE_FILE, 'utf8'));
+    console.log(`[Cache] Loaded ${Object.keys(translationCache).length} pre-packaged cached translations from ${READ_ONLY_CACHE_FILE}`);
+  }
+} catch (err) {
+  console.error('[Cache ERROR] Failed to load pre-packaged translation cache:', err.message);
+}
+
+// 2. Second, merge with any writable cache from the temp directory if in production
+if (!isWindows) {
+  try {
+    if (fs.existsSync(WRITE_CACHE_FILE)) {
+      const writableCache = JSON.parse(fs.readFileSync(WRITE_CACHE_FILE, 'utf8'));
+      translationCache = { ...translationCache, ...writableCache };
+      console.log(`[Cache] Merged with writable cache from ${WRITE_CACHE_FILE}. Total entries: ${Object.keys(translationCache).length}`);
+    }
+  } catch (err) {
+    console.error('[Cache ERROR] Failed to load writable translation cache:', err.message);
+  }
 }
 
 function saveCacheToDisk() {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(translationCache, null, 2), 'utf8');
+    fs.writeFileSync(WRITE_CACHE_FILE, JSON.stringify(translationCache, null, 2), 'utf8');
+    console.log(`[Cache] Saved translation cache to ${WRITE_CACHE_FILE}`);
   } catch (err) {
-    console.error('[Cache ERROR] Failed to save translation cache:', err);
+    console.error('[Cache ERROR] Failed to save translation cache:', err.message);
   }
 }
 
-/**
- * Robust regex helper to extract 11-char YouTube Video ID
- */
+// Standalone yt-dlp auto-downloader to make setup plug-and-play
+async function ensureYtDlp() {
+  if (fs.existsSync(ytdlpPath)) {
+    console.log(`✅ yt-dlp is ready at: ${ytdlpPath}`);
+    return true;
+  }
+  console.log(`⏳ Downloading yt-dlp from: ${YTDLP_URL}...`);
+  try {
+    const res = await fetch(YTDLP_URL);
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const buffer = await res.arrayBuffer();
+    fs.writeFileSync(ytdlpPath, Buffer.from(buffer));
+    
+    // On Linux/macOS, we must set executable permissions
+    if (!isWindows) {
+      fs.chmodSync(ytdlpPath, 0o755);
+      console.log('🐧 Set executable permissions (chmod 755) for Linux/Cloud yt-dlp.');
+    }
+    
+    console.log('✅ yt-dlp downloaded and initialized successfully!');
+    return true;
+  } catch (err) {
+    console.error('❌ Failed to download yt-dlp:', err.message);
+    return false;
+  }
+}
+
 function getYouTubeId(url) {
-  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=|shorts\/)([^#\&\?]*).*/;
+  if (!url) return null;
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|shorts\/|watch\?v=|\&v=)([^#\&\?]*).*/;
   const match = url.match(regExp);
-  return (match && match[2].length === 11) ? match[2] : null;
+  if (match && match[2].length === 11) {
+    return match[2];
+  }
+  const trimmed = url.trim();
+  if (trimmed.length === 11 && /^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return null;
 }
 
-/**
- * Converts seconds into a user-friendly timestamp string (e.g. 01:23)
- */
-function formatTime(seconds) {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-}
+const downloadAudio = (videoId) => {
+  return new Promise((resolve, reject) => {
+    const tempDir = isWindows ? path.join(__dirname, 'temp') : '/tmp/media';
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
 
-// Structured JSON Response Schema for Gemini
-const responseSchema = {
-  type: "OBJECT",
-  properties: {
-    summary: {
-      type: "STRING",
-      description: "A highly comprehensive, premium, structured summary of the video content translated to the target language. Focus on key takeaways, core details, and structured action items. Formatted as beautiful Markdown with headers, lists, and spacing."
-    },
-    subtitles: {
-      type: "ARRAY",
-      description: "List of synchronized translated subtitle segments, keeping the start and end timestamps exactly preserved.",
-      items: {
-        type: "OBJECT",
-        properties: {
-          start: { type: "NUMBER", description: "The start time of this subtitle segment in seconds." },
-          end: { type: "NUMBER", description: "The end time of this subtitle segment in seconds." },
-          text: { type: "STRING", description: "The translated subtitle text for this segment in the target language." }
-        },
-        required: ["start", "end", "text"]
+    // Clean existing test files for this video to avoid conflicts
+    try {
+      fs.readdirSync(tempDir).forEach(f => {
+        if (f.startsWith(videoId)) {
+          fs.unlinkSync(path.join(tempDir, f));
+        }
+      });
+    } catch (e) {}
+
+    const outputTemplate = path.join(tempDir, `${videoId}.%(ext)s`);
+    const args = [
+      `https://www.youtube.com/watch?v=${videoId}`,
+      '-f', 'ba', // Download the best audio track directly
+      '-o', outputTemplate,
+      '--no-playlist',
+      '--js-runtimes', `node:${process.execPath}`,
+      '--sleep-requests', '1' // Small delay between requests to mimic human behavior
+    ];
+
+    if (proxyUrl) {
+      args.push('--proxy', proxyUrl);
+      console.log(`🌐 [yt-dlp Proxy] Routing download through proxy: ${proxyUrl.replace(/:[^:@]+@/, ':****@')}`);
+    }
+
+    // Convert cookies.json to Netscape format if it exists, and write to writable location
+    const cookiesJsonPath = path.join(__dirname, 'cookies.json');
+    let finalCookiesPath = null;
+    if (fs.existsSync(cookiesJsonPath)) {
+      try {
+        const jsonContent = JSON.parse(fs.readFileSync(cookiesJsonPath, 'utf8'));
+        let netscapeString = "# Netscape HTTP Cookie File\n# Generated programmatically from cookies.json\n\n";
+        const cookiesArray = Array.isArray(jsonContent) ? jsonContent : [jsonContent];
+        
+        for (const cookie of cookiesArray) {
+          if (!cookie.domain || !cookie.name) continue;
+          const domain = cookie.domain;
+          const flag = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+          const pathVal = cookie.path || '/';
+          const secure = cookie.secure ? 'TRUE' : 'FALSE';
+          const expiration = cookie.expirationDate ? Math.round(cookie.expirationDate) : Math.round(Date.now() / 1000 + 31536000);
+          const name = cookie.name;
+          const value = cookie.value || '';
+          
+          netscapeString += `${domain}\t${flag}\t${pathVal}\t${secure}\t${expiration}\t${name}\t${value}\n`;
+        }
+        
+        const targetCookiesDir = isWindows ? tempDir : '/tmp';
+        if (!fs.existsSync(targetCookiesDir)) {
+          fs.mkdirSync(targetCookiesDir, { recursive: true });
+        }
+        const convertedPath = path.join(targetCookiesDir, 'cookies.txt');
+        fs.writeFileSync(convertedPath, netscapeString, 'utf8');
+        finalCookiesPath = convertedPath;
+        console.log(`🍪 Successfully converted JSON cookies to Netscape format at: ${convertedPath}`);
+      } catch (err) {
+        console.error(`❌ Error parsing/converting cookies.json: ${err.message}`);
       }
     }
-  },
-  required: ["summary", "subtitles"]
+
+    const runYtDlp = (argsList, attemptNoCookies = false) => {
+      return new Promise((resolveRun, rejectRun) => {
+        const activeArgs = [...argsList];
+        if (attemptNoCookies) {
+          const cookiesIdx = activeArgs.indexOf('--cookies');
+          if (cookiesIdx !== -1) {
+            activeArgs.splice(cookiesIdx, 2);
+          }
+        }
+        console.log(`🎬 [yt-dlp] Running download (Attempt: ${attemptNoCookies ? 'WITHOUT COOKIES' : 'WITH COOKIES'})...`);
+        execFile(ytdlpPath, activeArgs, (error, stdout, stderr) => {
+          if (error) {
+            return rejectRun({ error, stderr });
+          }
+          resolveRun(stdout);
+        });
+      });
+    };
+
+    if (finalCookiesPath && fs.existsSync(finalCookiesPath)) {
+      args.push('--cookies', finalCookiesPath);
+      console.log(`🍪 Passing Netscape cookies to yt-dlp: ${finalCookiesPath}`);
+    }
+
+    runYtDlp(args, false)
+      .then(() => {
+        const files = fs.readdirSync(tempDir).filter(f => f.startsWith(videoId));
+        if (files.length === 0) {
+          return reject(new Error('Audio file was not created by yt-dlp.'));
+        }
+        const filePath = path.join(tempDir, files[0]);
+        const ext = path.extname(files[0]).toLowerCase();
+        resolve({ filePath, ext });
+      })
+      .catch(({ error, stderr }) => {
+        const hasCookies = args.includes('--cookies');
+        if (hasCookies) {
+          console.warn(`⚠️ [yt-dlp Warning] Initial attempt with cookies failed. Retrying WITHOUT cookies as fallback...`);
+          runYtDlp(args, true)
+            .then(() => {
+              const files = fs.readdirSync(tempDir).filter(f => f.startsWith(videoId));
+              if (files.length === 0) {
+                return reject(new Error('Audio file was not created by yt-dlp.'));
+              }
+              const filePath = path.join(tempDir, files[0]);
+              const ext = path.extname(files[0]).toLowerCase();
+              resolve({ filePath, ext });
+            })
+            .catch((retryErr) => {
+              reject(new Error(`yt-dlp failed on both attempts. Stderr: ${retryErr.stderr || retryErr.error.message}`));
+            });
+        } else {
+          reject(new Error(`yt-dlp failed: ${error.message}. Stderr: ${stderr}`));
+        }
+      });
+  });
 };
 
 /**
- * Robust helper to query Gemini generateContent with up to 3 retries and exponential backoff
- */
-async function generateContentWithRetry(model, params, maxRetries = 3, initialDelay = 1500) {
-  let attempt = 0;
-  let activeModel = model;
-  let modelName = model.model || "gemini-2.5-flash";
-
-  while (attempt < maxRetries) {
-    try {
-      console.log(`[Gemini API] Querying model ${modelName} (Attempt ${attempt + 1}/${maxRetries})...`);
-      const result = await activeModel.generateContent(params);
-      return result;
-    } catch (err) {
-      attempt++;
-      const errorMessage = err.message || '';
-      console.warn(`[Gemini API Warning] Attempt ${attempt} failed with ${modelName}: ${errorMessage}`);
-      
-      // Smart Fallback Chain for Quota Exceeded (429) or Unsupported (404) errors
-      const isQuotaOrNotFoundError = errorMessage.includes("429") || errorMessage.includes("Quota") || errorMessage.includes("limit") || errorMessage.includes("exceeded") || errorMessage.includes("404") || errorMessage.includes("not found");
-      
-      if (isQuotaOrNotFoundError) {
-        if (modelName.includes("2.5")) {
-          console.log(`[Gemini API] Quota exceeded or error for ${modelName}. Automatically falling back to gemini-2.0-flash!`);
-          modelName = "gemini-2.0-flash";
-          activeModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-          attempt = 0; // Reset attempts so the fallback model gets its full retry budget
-          continue;
-        } else if (modelName.includes("2.0")) {
-          console.log(`[Gemini API] Quota exceeded or error for ${modelName}. Automatically falling back to gemini-flash-latest!`);
-          modelName = "gemini-flash-latest";
-          activeModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-          attempt = 0; // Reset attempts so the fallback model gets its full retry budget
-          continue;
-        }
-      }
-      
-      if (attempt >= maxRetries) {
-        throw err;
-      }
-      
-      const delay = initialDelay * Math.pow(2, attempt - 1);
-      console.log(`[Gemini API] Retrying in ${delay}ms due to error...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
-
-/**
  * Merges consecutive short caption segments into longer semantic sentence blocks (max 12 seconds).
- * This dramatically reduces the translation output token count, speeding up processing by 10x,
- * while vastly improving translation context and quality.
  */
 function combineCaptions(rawCaptions, maxDuration = 12) {
   if (!rawCaptions || rawCaptions.length === 0) return [];
@@ -209,13 +335,18 @@ async function translateTextFree(texts, targetLang = 'Sinhala') {
     'Hindi': 'hi',
     'Spanish': 'es',
     'German': 'de',
-    'French': 'fr'
+    'French': 'fr',
+    'Japanese': 'ja',
+    'Chinese': 'zh-CN',
+    'Arabic': 'ar'
   };
   const tl = langCodes[targetLang] || 'si';
   
   console.log(`[Free Translator] Super Fast Batch translating ${texts.length} segments to lang code: ${tl}...`);
   const translations = [];
   const batchSize = 8; // Safely sized batch to prevent HTTP 400/URL length limits
+  let sourceLanguage = 'English';
+  let firstBatch = true;
   
   for (let i = 0; i < texts.length; i += batchSize) {
     const chunk = texts.slice(i, i + batchSize);
@@ -226,6 +357,25 @@ async function translateTextFree(texts, targetLang = 'Sinhala') {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP error ${res.status}`);
       const data = await res.json();
+      
+      if (firstBatch && data && data[2]) {
+        const detectedCode = data[2];
+        const langMap = {
+          'si': 'Sinhala',
+          'en': 'English',
+          'ta': 'Tamil',
+          'hi': 'Hindi',
+          'es': 'Spanish',
+          'de': 'German',
+          'fr': 'French',
+          'ja': 'Japanese',
+          'zh-CN': 'Chinese',
+          'zh': 'Chinese',
+          'ar': 'Arabic'
+        };
+        sourceLanguage = langMap[detectedCode] || 'English';
+        firstBatch = false;
+      }
       
       let translatedLines = [];
       if (data && data[0]) {
@@ -260,56 +410,48 @@ async function translateTextFree(texts, targetLang = 'Sinhala') {
     // Tiny delay between small batches to protect rate limits while maintaining ultra-high speed
     await new Promise(r => setTimeout(r, 20));
   }
-  return translations;
+  return { translations, sourceLanguage };
 }
 
-/**
- * Main Processing API endpoint
- * GET /api/process?url=...&lang=...
- */
-app.get('/api/process', async (req, res) => {
-  const { url, lang = 'Sinhala' } = req.query;
+app.post('/api/process', async (req, res) => {
+  const urlInput = req.body.url;
+  const lang = req.body.lang || 'Sinhala';
 
-  if (!url) {
-    return res.status(400).json({ error: 'YouTube URL is required.' });
-  }
+  if (!urlInput) return res.status(400).json({ success: false, error: 'YouTube URL එක අවශ්‍යයි.' });
+  const videoId = getYouTubeId(urlInput);
+  if (!videoId) return res.status(400).json({ success: false, error: 'වලංගු නොවන YouTube සබැඳියකි.' });
 
-  const videoId = getYouTubeId(url);
-  if (!videoId) {
-    return res.status(400).json({ error: 'Invalid YouTube URL. Please make sure it contains an 11-character video ID.' });
-  }
-
-  // Persistent Cache Check for Instant 0-second loading
   const cacheKey = `${videoId}_${lang}`;
   if (translationCache[cacheKey]) {
     console.log(`[Cache HIT] Returning cached translation instantly for ${cacheKey}`);
     return res.json({
-      videoId,
+      success: true,
+      videoId: videoId,
       method: 'Cached Translation (Instant)',
       language: lang,
-      summary: translationCache[cacheKey].summary,
+      sourceLanguage: translationCache[cacheKey].sourceLanguage || 'English',
       subtitles: translationCache[cacheKey].subtitles
     });
   }
 
-  console.log(`[Processor] Started processing Video ID: ${videoId} for target language: ${lang}`);
+  console.log(`🎬 [Pipeline Engine] Processing Video ID: ${videoId} for target language: ${lang}`);
 
   let audioPath = null;
-  let uploadResult = null;
 
   try {
     let rawCaptions = null;
     let methodUsed = 'Native YouTube Captions';
 
-    // STEP 1: Attempt to fetch native captions
+    // Phase 1: Try to fetch native captions
     try {
       console.log(`[Processor] Attempting to fetch native YouTube captions...`);
-      const transcriptList = await YoutubeTranscript.fetchTranscript(videoId);
+      const transcriptList = await YoutubeTranscript.fetchTranscript(videoId, {
+        ...(fetchConfig.fetch ? { fetch: fetchConfig.fetch } : {})
+      });
       
       if (transcriptList && transcriptList.length > 0) {
         rawCaptions = transcriptList
           .map(item => {
-            // Strip sound/music descriptors in brackets or parentheses like [Music], (Laughter), [संगीत]
             const cleanedText = item.text.replace(/\[[^\]]*\]|\([^)]*\)/g, '').trim();
             return {
               start: Number((item.offset / 1000).toFixed(2)),
@@ -317,307 +459,271 @@ app.get('/api/process', async (req, res) => {
               text: cleanedText
             };
           })
-          .filter(item => item.text.length > 0); // Filter out empty segments (e.g. music-only segments)
+          .filter(item => item.text.length > 0);
         console.log(`[Processor] Successfully fetched and cleaned ${rawCaptions.length} native caption segments.`);
       }
     } catch (err) {
       console.log(`[Processor] Native captions fetching failed or not available: ${err.message}`);
     }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-    // STEP 2: Handle fallback if no native captions are found
-    if (!rawCaptions) {
-      methodUsed = 'Multimodal Gemini Audio Processing';
-      console.log(`[Processor] Fallback: Captions unavailable. Starting audio download for multimodal Gemini processing...`);
-
-      // Define standard Chrome headers to bypass YouTube bot detection & signature decipher issues
-      const chromeHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.A.Brand";v="99"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-      };
-
-      if (process.env.YOUTUBE_COOKIE) {
-        chromeHeaders['cookie'] = process.env.YOUTUBE_COOKIE;
-      }
-
-      const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
-        requestOptions: { headers: chromeHeaders }
-      });
-      
-      // Filter for audio formats
-      const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-      if (!audioFormats || audioFormats.length === 0) {
-        throw new Error('No audio-only streams available for this YouTube video.');
-      }
-
-      // Choose standard audio containers compatible with Gemini (m4a, webm)
-      const format = ytdl.chooseFormat(audioFormats, {
-        quality: 'highestaudio',
-        filter: (f) => f.container === 'm4a' || f.container === 'webm'
-      });
-
-      console.log(`[Processor] Selected audio format: container=${format.container}, bitrate=${format.audioBitrate}kbps`);
-      const ext = format.container || 'm4a';
-      audioPath = path.join(tempDir, `${videoId}.${ext}`);
-
-      // Pipe to local file
-      const writeStream = fs.createWriteStream(audioPath);
-      await new Promise((resolve, reject) => {
-        ytdl.downloadFromInfo(info, { 
-          format,
-          requestOptions: { headers: chromeHeaders }
-        })
-          .pipe(writeStream)
-          .on('finish', resolve)
-          .on('error', reject);
-      });
-
-      // Get downloaded audio size
-      const stats = fs.statSync(audioPath);
-      const fileSizeMB = stats.size / (1024 * 1024);
-      console.log(`[Processor] Audio downloaded successfully. File path: ${audioPath}, Size: ${fileSizeMB.toFixed(2)} MB`);
-
-      if (fileSizeMB > 25) {
-        throw new Error('Downloaded audio stream exceeds the maximum allowed size (25MB) for processing. Please try a shorter video.');
-      }
-
-      // Upload to Gemini Files API
-      console.log(`[Processor] Uploading audio to Google Gemini Files API...`);
-      let mimeType = 'audio/mp4';
-      if (ext === 'webm') mimeType = 'audio/webm';
-      else if (ext === 'm4a') mimeType = 'audio/x-m4a';
-
-      uploadResult = await fileManager.uploadFile(audioPath, {
-        mimeType,
-        displayName: `Audio-${videoId}`
-      });
-
-      console.log(`[Processor] File uploaded successfully to Gemini. URI: ${uploadResult.file.uri}`);
-
-      // STEP 3: Invoke Multimodal Gemini API to transcribe & translate (skip summary to save 15 seconds!)
-      console.log(`[Processor] Querying Gemini Multimodal model...`);
-      const prompt = `You are a premium AI video translator and transcriber.
-Your tasks are:
-1. Listen carefully to the uploaded audio stream, transcribe it, and translate the spoken text into ${lang}.
-2. Break the translated speech down into clear, highly readable, short subtitle segments. For each segment, output the exact start and end times in seconds (e.g. 0 to 4.5, 4.5 to 8.2). Make sure timestamps align with the spoken audio and don't overlap.
-3. Set the "summary" field in the output JSON to a simple string value "Disabled".
-
-You MUST return a single JSON object strictly matching the required JSON schema structure. Do not wrap the JSON in Markdown code block formatting.`;
-
-      const result = await generateContentWithRetry(model, {
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                fileData: {
-                  fileUri: uploadResult.file.uri,
-                  mimeType: uploadResult.file.mimeType
-                }
-              },
-              { text: prompt }
-            ]
-          }
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema
-        }
-      });
-
-      const responseText = result.response.text();
-      const parsedData = JSON.parse(responseText);
-
-      // Save translation results to cache
-      translationCache[cacheKey] = {
-        summary: parsedData.summary || "Disabled",
-        subtitles: parsedData.subtitles
-      };
-      saveCacheToDisk();
-
-      // Return processed details
-      return res.json({
-        videoId,
-        method: methodUsed,
-        language: lang,
-        summary: parsedData.summary || "Disabled",
-        subtitles: parsedData.subtitles
-      });
-
-    } else {
-      // Native YouTube Captions are available - Step 3: Run optimized parallel standard Gemini Translation & Summarization
-      console.log(`[Processor] Native captions available. Initiating optimized single-request translation & parallel summarization...`);
-      
-      // Combine raw captions into larger semantic blocks (12 seconds max) to speed up translation by 10x and improve flow!
+    if (rawCaptions) {
+      // Native Captions available
       const mergedCaptions = combineCaptions(rawCaptions, 12);
       console.log(`[Processor] Merged ${rawCaptions.length} raw segments into ${mergedCaptions.length} semantic blocks.`);
-
-      const summaryText = "Disabled";
-
-      // 2. Translate all merged subtitle texts in a single optimized request (plain text array)
       const allTexts = mergedCaptions.map(c => c.text);
-      console.log(`[Processor] Translating all ${allTexts.length} segments in a single optimized request...`);
 
-      const translationSchema = {
-        type: "OBJECT",
-        properties: {
-          translations: {
-            type: "ARRAY",
-            description: "List of translated subtitle text strings in the target language. Must be in the exact same 1-to-1 order and length as the input text array.",
-            items: { type: "STRING" }
-          }
-        },
-        required: ["translations"]
-      };
-
-      const translatePrompt = `You are a premium, professional video translator.
-Translate the following array of video subtitle text strings (which may be in English, Hindi, Spanish, or any other source language) into ${lang} in the exact same 1-to-1 order.
+      let translations = [];
+      let sourceLanguage = 'English';
+      
+      // Attempt A: Translate using Gemini
+      try {
+        console.log(`🧠 Translating all ${allTexts.length} segments via Gemini...`);
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        const translatePrompt = `You are a professional video translator.
+Translate the following array of video subtitle strings into ${lang} in the exact same 1-to-1 order.
 Do not omit any items. Maintain the exact same number of elements in the output list.
+Also, detect the primary language of the input subtitles and return it in the "sourceLanguage" field (e.g. "Sinhala", "Tamil", "English", "Spanish", "French", "German", "Japanese", "Chinese", "Hindi", "Arabic").
+Input: ${JSON.stringify(allTexts)}
+Return response ONLY as a JSON object with this format:
+{ "sourceLanguage": "detected_language_name", "translations": ["translated_string_1", "translated_string_2", ...] }`;
+        
+        const result = await model.generateContent(translatePrompt);
+        const responseText = result.response.text();
+        const cleanJsonString = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(cleanJsonString);
+        translations = parsed.translations || [];
+        sourceLanguage = parsed.sourceLanguage || 'English';
+      } catch (geminiErr) {
+        console.warn(`[Processor Warning] Gemini Translation failed: ${geminiErr.message}. Toggling Free Keyless Translation Fallback!`);
+        methodUsed = 'Native Captions + Free Keyless Translation Fallback';
+        const freeRes = await translateTextFree(allTexts, lang);
+        translations = freeRes.translations;
+        sourceLanguage = freeRes.sourceLanguage;
+      }
 
-Input Texts Array:
-${JSON.stringify(allTexts)}
-
-You MUST return a single JSON object matching this schema:
-{
-  "translations": ["translated_string_1", "translated_string_2", ...]
-}`;
-
-      // Run only the translation API call (ultra stable and extremely fast!)
-      const allTranslations = await generateContentWithRetry(model, {
-        contents: [{ role: 'user', parts: [{ text: translatePrompt }] }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: translationSchema }
-      }).then(result => {
-        try {
-          const parsed = JSON.parse(result.response.text());
-          return parsed.translations || [];
-        } catch (err) {
-          console.error(`[Processor] Error parsing translations:`, err);
-          return allTexts; // Fallback to original text if parse fails
-        }
-      }).catch(async (err) => {
-        console.warn(`[Processor Warning] Gemini Translation failed: ${err.message}. Toggling Free Keyless Translation Fallback!`);
-        methodUsed = 'Free Keyless Google Translation Fallback';
-        try {
-          return await translateTextFree(allTexts, lang);
-        } catch (freeErr) {
-          console.error(`[Processor ERROR] Free translation fallback failed:`, freeErr);
-          return allTexts; // Fallback to original text
-        }
-      });
-
-      console.log(`[Processor] Optimized translation completed successfully. Total translated segments: ${allTranslations.length}`);
-
-      // 3. Zip the translated texts back with original timestamps
       const subtitles = mergedCaptions.map((cap, idx) => ({
         start: cap.start,
         end: cap.end,
-        text: allTranslations[idx] || cap.text
+        text: cap.text,
+        sinhala: translations[idx] || cap.text
       }));
 
-      // Save translation results to cache
-      translationCache[cacheKey] = {
-        summary: summaryText,
-        subtitles
-      };
+      translationCache[cacheKey] = { subtitles, sourceLanguage };
       saveCacheToDisk();
 
       return res.json({
-        videoId,
+        success: true,
+        videoId: videoId,
         method: methodUsed,
         language: lang,
-        summary: summaryText,
+        sourceLanguage,
         subtitles
       });
     }
 
-  } catch (error) {
-    console.error(`[Processor ERROR] ${error.stack}`);
-    return res.status(500).json({ error: error.message || 'An error occurred during video translation and processing.' });
-  } finally {
-    // CLEANUP Phase: Always clean up temporary audio files and Gemini Files
-    if (audioPath && fs.existsSync(audioPath)) {
-      try {
-        fs.unlinkSync(audioPath);
-        console.log(`[Cleanup] Deleted local temporary audio file: ${audioPath}`);
-      } catch (err) {
-        console.error(`[Cleanup ERROR] Failed to delete local audio file: ${err.message}`);
-      }
-    }
+    // Phase 2: Native captions not available, return client-side fallback instructions to keep IP clean & compliant
+    console.log(`[Processor] Captions unavailable. Triggering client-side audio download fallback.`);
+    return res.json({
+      success: true,
+      fallback: 'client_audio_download',
+      videoId: videoId,
+      language: lang,
+      cobaltInstances: [
+        'https://api.cobalt.blackcat.sweeux.org',
+        'https://fox.kittycat.boo',
+        'https://api.dl.woof.monster'
+      ]
+    });
 
-    if (uploadResult && uploadResult.file && uploadResult.file.name) {
-      try {
-        await fileManager.deleteFile(uploadResult.file.name);
-        console.log(`[Cleanup] Deleted uploaded audio file from Gemini server: ${uploadResult.file.name}`);
-      } catch (err) {
-        console.error(`[Cleanup ERROR] Failed to delete Gemini server file: ${err.message}`);
-      }
-    }
+  } catch (error) {
+    console.error('🔥 Backend Error:', error.stack || error.message);
+    let errorMsg = 'පරිවර්තනය කිරීමේදී දෝෂයක් සිදුවිය. නැවත උත්සාහ කරන්න.';
+    return res.status(500).json({ success: false, error: errorMsg });
   }
 });
 
-// Serve feedback submission endpoint
-app.post('/api/feedback', async (req, res) => {
-  const { name, email, message } = req.body;
-  if (!message) {
-    return res.status(400).json({ error: 'Message is required.' });
+app.post('/api/process-audio', async (req, res) => {
+  const { videoId, lang, audioBase64, mimeType } = req.body;
+  if (!videoId || !audioBase64) {
+    return res.status(400).json({ success: false, error: 'Video ID and audio data are required.' });
   }
 
-  const feedbackData = {
-    id: Date.now().toString(),
-    timestamp: new Date().toISOString(),
-    name: name || 'Anonymous',
-    email: email || 'No email provided',
-    message
-  };
+  const cacheKey = `${videoId}_${lang}`;
+  if (translationCache[cacheKey]) {
+    console.log(`[Cache HIT] Returning cached translation instantly for ${cacheKey}`);
+    return res.json({
+      success: true,
+      videoId: videoId,
+      method: 'Cached Translation (Instant)',
+      language: lang,
+      sourceLanguage: translationCache[cacheKey].sourceLanguage || 'English',
+      subtitles: translationCache[cacheKey].subtitles
+    });
+  }
+
+  const tempDir = isWindows ? path.join(__dirname, 'temp') : '/tmp/media';
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
+  const audioPath = path.join(tempDir, `${videoId}.mp3`);
+  let methodUsed = 'Client-Side Audio Upload + Gemini Multimodal';
+  let sourceLanguage = 'English';
 
   try {
-    const feedbackFile = isServerless ? path.join(os.tmpdir(), 'feedbacks.json') : path.join(__dirname, 'feedbacks.json');
-    let feedbacks = [];
-    if (fs.existsSync(feedbackFile)) {
-      feedbacks = JSON.parse(fs.readFileSync(feedbackFile, 'utf8'));
+    // Write base64 audio to file
+    console.log(`📥 Received Base64 audio for Video ID: ${videoId}. Writing to disk...`);
+    const audioBuffer = Buffer.from(audioBase64, 'base64');
+    fs.writeFileSync(audioPath, audioBuffer);
+    console.log(`💾 Saved temp audio file to ${audioPath} (${audioBuffer.length} bytes)`);
+
+    let subtitles = [];
+    let geminiSuccess = false;
+
+    // Attempt A: Try Gemini Multimodal (using gemini-1.5-pro as primary, fallback to gemini-2.0-flash)
+    const geminiModels = ['gemini-1.5-pro', 'gemini-2.0-flash'];
+    for (const modelName of geminiModels) {
+      try {
+        console.log(`🧠 Sending audio data to Google Gemini (${modelName})...`);
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const prompt = `Listen to this audio track extremely carefully. 
+Generate highly accurate subtitles in ${lang} language with precise start and end timestamps.
+Also, detect the primary language of the spoken audio and return it in the "sourceLanguage" field (e.g. "Sinhala", "Tamil", "English", "Spanish", "French", "German", "Japanese", "Chinese", "Hindi", "Arabic").
+You must return the response ONLY as a valid and clean JSON object matching the format below:
+{
+  "sourceLanguage": "detected_language_name",
+  "subtitles": [
+    { "start": 0.0, "end": 4.2, "text": "English original text line here", "sinhala": "නිවැරදි සිංහල පරිවර්තනය මෙතන" }
+  ]
+}`;
+
+        const result = await model.generateContent([
+          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+          prompt
+        ]);
+
+        const responseText = result.response.text();
+        const cleanJsonString = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+        const resultData = JSON.parse(cleanJsonString);
+        subtitles = resultData.subtitles || [];
+        sourceLanguage = resultData.sourceLanguage || 'English';
+        if (subtitles.length > 0) {
+          geminiSuccess = true;
+          console.log(`✅ Gemini Multimodal processing (${modelName}) succeeded with ${subtitles.length} segments.`);
+          break;
+        }
+      } catch (geminiErr) {
+        console.warn(`[Processor Warning] Gemini Multimodal (${modelName}) failed: ${geminiErr.message}`);
+      }
     }
-    feedbacks.push(feedbackData);
-    fs.writeFileSync(feedbackFile, JSON.stringify(feedbacks, null, 2), 'utf8');
 
-    console.log(`==================================================`);
-    console.log(`[Feedback Received] Saved to feedbacks.json`);
-    console.log(` From: ${feedbackData.name} <${feedbackData.email}>`);
-    console.log(` Message: ${feedbackData.message}`);
-    console.log(` Target Email: biz.sirimal@gmail.com`);
-    console.log(`==================================================`);
+    // Attempt B: Groq Whisper + Free Translation Fallback
+    if (!geminiSuccess) {
+      methodUsed = 'Client-Side Audio Upload + Groq Whisper + Free Translation';
+      console.log(`🚀 Initiating Groq Whisper audio transcription...`);
+      
+      const apiKey = process.env.GROQ_API_KEY;
+      if (!apiKey) {
+        throw new Error('Groq API Key is not set in .env file.');
+      }
 
-    return res.json({ success: true, message: 'Feedback saved successfully.' });
-  } catch (err) {
-    console.error('[Feedback ERROR] Failed to save feedback:', err);
-    return res.status(500).json({ error: 'Failed to submit feedback. Please try again.' });
+      const form = new FormData();
+      form.append('file', fs.createReadStream(audioPath));
+      form.append('model', 'whisper-large-v3-turbo');
+      form.append('response_format', 'verbose_json');
+
+      const whisperRes = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, {
+        headers: {
+          ...form.getHeaders(),
+          'Authorization': `Bearer ${apiKey}`
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
+      });
+
+      const segments = whisperRes.data.segments || [];
+      const whisperLang = whisperRes.data.language || 'english';
+      
+      // Capitalize first letter of whisperLang
+      const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1);
+      sourceLanguage = capitalize(whisperLang);
+      
+      console.log(`✅ Groq Whisper transcribed ${segments.length} segments in language ${sourceLanguage}.`);
+
+      if (segments.length === 0) {
+        throw new Error('Whisper transcribed 0 segments.');
+      }
+
+      // Convert and merge Whisper segments
+      const rawSegments = segments.map(s => ({
+        start: Number(s.start.toFixed(2)),
+        end: Number(s.end.toFixed(2)),
+        text: s.text.trim()
+      }));
+
+      const mergedSegments = combineCaptions(rawSegments, 12);
+      console.log(`[Processor] Merged ${rawSegments.length} Whisper segments into ${mergedSegments.length} semantic blocks.`);
+
+      const allTexts = mergedSegments.map(s => s.text);
+      console.log(`[Processor] Translating transcribed text segments to ${lang}...`);
+      const freeRes = await translateTextFree(allTexts, lang);
+      const translations = freeRes.translations;
+
+      subtitles = mergedSegments.map((s, idx) => ({
+        start: s.start,
+        end: s.end,
+        text: s.text,
+        sinhala: translations[idx] || s.text
+      }));
+    }
+
+    // Clean up temporary audio file from disk
+    try {
+      if (fs.existsSync(audioPath)) {
+        fs.unlinkSync(audioPath);
+        console.log(`🧹 Cleaned up temporary audio file: ${audioPath}`);
+      }
+    } catch (e) {
+      console.error(`Failed to clean up temporary file: ${e.message}`);
+    }
+
+    translationCache[cacheKey] = { subtitles, sourceLanguage };
+    saveCacheToDisk();
+
+    return res.json({
+      success: true,
+      videoId: videoId,
+      method: methodUsed,
+      language: lang,
+      sourceLanguage,
+      subtitles
+    });
+
+  } catch (error) {
+    console.error('🔥 Backend Process Audio Error:', error.stack || error.message);
+    
+    // Clean up temporary audio file if error occurs
+    if (fs.existsSync(audioPath)) {
+      try {
+        fs.unlinkSync(audioPath);
+      } catch (e) {}
+    }
+
+    return res.status(500).json({ success: false, error: 'පරිවර්තනය කිරීමේදී දෝෂයක් සිදුවිය. නැවත උත්සාහ කරන්න.' });
   }
 });
 
-// Serve health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date() });
-});
+// Export for Firebase Cloud Functions v2
+const { onRequest } = require('firebase-functions/v2/https');
+exports.translator = onRequest({ cors: true, timeoutSeconds: 300, memory: '1GiB' }, app);
 
-// Start Express Server
-if (!isServerless) {
-  app.listen(PORT, () => {
-    console.log(`==================================================`);
-    console.log(` AI Video Translator Backend is running!`);
-    console.log(` Port: ${PORT}`);
-    console.log(` Endpoint: http://localhost:${PORT}/api/process`);
-    console.log(`==================================================`);
+// Only listen directly if run locally (not as a Firebase Cloud Function)
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Standalone Backend running on port ${PORT}`);
+    ensureYtDlp().catch(err => console.error('Failed to pre-download yt-dlp:', err.message));
   });
+} else {
+  // If running inside Firebase Functions, pre-initialize yt-dlp on container startup
+  ensureYtDlp().catch(err => console.error('Failed to pre-download yt-dlp:', err.message));
 }
-
-// Export the Express app wrapped in Firebase Cloud Functions (2nd Gen)
-exports.translator = onRequest({
-  timeoutSeconds: 300,
-  memory: '1GiB'
-}, app);
-
-// Trigger restart: Port 5005 freed successfully

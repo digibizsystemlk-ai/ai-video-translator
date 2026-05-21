@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { ScreenOrientation } from '@capacitor/screen-orientation';
 
-export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, activeSubtitleText, isShort }) {
+export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, activeSubtitleText, isShort, subtitlesLoading, lang }) {
   const wrapperRef = useRef(null);
   const containerRef = useRef(null);
   const playerRef = useRef(null);
@@ -8,15 +9,20 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
+  const [isFallbackFullscreen, setIsFallbackFullscreen] = useState(false);
 
+  // Handle browser native fullscreen change events
   useEffect(() => {
-    const handleFsChange = () => {
+    const handleFsChange = async () => {
       const isFS = !!document.fullscreenElement;
       setIsFullscreen(isFS);
       if (!isFS) {
-        if (screen.orientation && typeof screen.orientation.unlock === 'function') {
-          screen.orientation.unlock();
+        try {
+          await ScreenOrientation.unlock();
+        } catch (e) {
+          console.warn("Screen orientation unlock failed:", e);
         }
+        setIsFallbackFullscreen(false);
       }
     };
     document.addEventListener('fullscreenchange', handleFsChange);
@@ -30,52 +36,39 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
       document.removeEventListener('mozfullscreenchange', handleFsChange);
       document.removeEventListener('msfullscreenchange', handleFsChange);
     };
-  }, [isShort]);
+  }, []);
 
-  const handleStartPlayImmersive = () => {
-    const wrapper = wrapperRef.current;
-    if (wrapper) {
-      wrapper.requestFullscreen().then(() => {
-        if (screen.orientation && typeof screen.orientation.lock === 'function') {
-          screen.orientation.lock(isShort ? 'portrait' : 'landscape').catch(err => {
-            console.warn("Screen orientation lock failed or ignored:", err);
-          });
-        }
-      }).catch(err => {
-        console.error("Fullscreen request failed:", err);
-      });
-    }
 
-    if (playerRef.current && typeof playerRef.current.playVideo === 'function') {
+
+  // Ensure the video plays immediately and doesn't get blocked by subtitle loading
+  useEffect(() => {
+    if (!playerRef.current) return;
+    if (typeof playerRef.current.playVideo === 'function') {
       playerRef.current.playVideo();
     }
-    setHasStarted(true);
-  };
+  }, [videoId]);
 
-  const [isFallbackFullscreen, setIsFallbackFullscreen] = useState(false);
-
-  const handleFullscreenToggle = () => {
-    const wrapper = wrapperRef.current;
-    if (wrapper) {
-      if (typeof wrapper.requestFullscreen === 'function') {
-        if (!document.fullscreenElement) {
-          wrapper.requestFullscreen().then(() => {
-            setIsFallbackFullscreen(false);
-          }).catch(err => {
-            console.warn("Native fullscreen rejected, triggering fallback:", err);
-            setIsFallbackFullscreen(prev => !prev);
-          });
-        } else {
-          document.exitFullscreen().then(() => {
-            setIsFallbackFullscreen(false);
-          }).catch(err => {
-            console.error("Error exiting fullscreen:", err);
-          });
+  const handleFullscreenToggle = async () => {
+    try {
+      if (!isFallbackFullscreen) {
+        setIsFallbackFullscreen(true);
+        setIsFullscreen(true);
+        try {
+          await ScreenOrientation.lock({ orientation: isShort ? 'portrait' : 'landscape' });
+        } catch (err) {
+          console.warn("Screen orientation lock failed:", err);
         }
       } else {
-        // Fallback for iOS Safari which doesn't support requestFullscreen
-        setIsFallbackFullscreen(prev => !prev);
+        setIsFallbackFullscreen(false);
+        setIsFullscreen(false);
+        try {
+          await ScreenOrientation.unlock();
+        } catch (e) {
+          console.warn("Screen orientation unlock failed:", e);
+        }
       }
+    } catch (err) {
+      console.warn("Fullscreen toggle failed:", err);
     }
   };
 
@@ -83,10 +76,8 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
     if (!videoId) return;
 
     setHasStarted(false);
-
     let playerInstance = null;
 
-    // Helper to start the polling interval
     const startPolling = (player) => {
       if (intervalRef.current) clearInterval(intervalRef.current);
       intervalRef.current = setInterval(() => {
@@ -97,7 +88,6 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
       }, 150);
     };
 
-    // Helper to stop polling
     const stopPolling = () => {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
@@ -106,7 +96,6 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
     };
 
     const createPlayer = () => {
-      // Create a new YT Player instance
       playerInstance = new window.YT.Player(containerRef.current, {
         videoId: videoId,
         playerVars: {
@@ -115,24 +104,25 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
           rel: 0,
           modestbranding: 1,
           enablejsapi: 1,
-          fs: 0, // Disable native fullscreen button which hides custom elements
+          fs: 0, // Custom overlays handle fullscreen manually to prevent YT interference
         },
         events: {
           onReady: (event) => {
             playerRef.current = event.target;
-            // Seek if we have an initial seek trigger
             if (seekTrigger) {
               event.target.seekTo(seekTrigger.time, true);
             }
             startPolling(event.target);
+            setHasStarted(true);
+
+            // Always play immediately when ready!
+            event.target.playVideo();
           },
           onStateChange: (event) => {
-            // YT.PlayerState.PLAYING is 1
             if (event.data === window.YT.PlayerState.PLAYING) {
               startPolling(event.target);
             } else {
               stopPolling();
-              // Update time once on pause/stop to capture exact spot
               if (event.target && typeof event.target.getCurrentTime === 'function') {
                 onTimeUpdate(event.target.getCurrentTime());
               }
@@ -142,24 +132,18 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
       });
     };
 
-    // Initialize YouTube Player API
     if (!window.YT) {
-      // If script not loaded, inject it
       const tag = document.createElement('script');
       tag.src = 'https://www.youtube.com/iframe_api';
-      
       const firstScriptTag = document.getElementsByTagName('script')[0];
       firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
 
-      // Global callback when API is ready
       window.onYouTubeIframeAPIReady = () => {
         createPlayer();
       };
     } else if (window.YT && window.YT.Player) {
-      // API already loaded, just create player
       createPlayer();
     } else {
-      // If script tag is in DOM but YT object is not ready yet, poll for it
       const checkYTApi = setInterval(() => {
         if (window.YT && window.YT.Player) {
           clearInterval(checkYTApi);
@@ -168,7 +152,6 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
       }, 100);
     }
 
-    // Cleanup on unmount
     return () => {
       stopPolling();
       if (playerInstance && typeof playerInstance.destroy === 'function') {
@@ -178,11 +161,10 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
     };
   }, [videoId]);
 
-  // Handle Seek Trigger changes
+  // Handle manual seek trigger shifts
   useEffect(() => {
     if (playerRef.current && seekTrigger && typeof playerRef.current.seekTo === 'function') {
       playerRef.current.seekTo(seekTrigger.time, true);
-      // Force play video on seeking
       if (typeof playerRef.current.playVideo === 'function') {
         playerRef.current.playVideo();
       }
@@ -191,7 +173,7 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
 
   return (
     <div ref={wrapperRef} className={`player-wrapper ${isFallbackFullscreen ? 'fallback-fullscreen' : ''}`} onDoubleClick={handleFullscreenToggle}>
-      {/* React-controlled wrapper to safely apply visibility styles without YouTube API iframe replacement interference */}
+      {/* Container holding the native YT Player iframe */}
       <div 
         style={{ 
           width: '100%', 
@@ -204,7 +186,7 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
         <div ref={containerRef} style={{ width: '100%', height: '100%' }}></div>
       </div>
       
-      {/* Custom Fullscreen Toggle Button */}
+      {/* Floating Action Button to toggle Fullscreen */}
       {hasStarted && (
         <button 
           className="custom-fullscreen-btn" 
@@ -215,53 +197,26 @@ export default function YouTubePlayer({ videoId, onTimeUpdate, seekTrigger, acti
         </button>
       )}
 
-      {/* Mobile Landscape Full Screen Prompt Banner */}
+      {/* Mobile Inline Full Screen Assist Prompt */}
       {!isFullscreen && hasStarted && (
         <button 
           className="mobile-landscape-fs-prompt"
           onClick={handleFullscreenToggle}
         >
           <i className="fa-solid fa-expand" style={{ color: 'var(--accent-blue)' }}></i>
-          {localStorage.getItem('yt_translator_default_lang') === 'Sinhala' 
-            ? 'පූර්ණ තිරය (Enter Full Screen)' 
-            : 'Go Full Screen'}
+          Go Full Screen
         </button>
       )}
 
-      {/* Immersive Premium Play Overlay */}
-      {!hasStarted && (
-        <div 
-          className="immersive-play-overlay"
-          onClick={handleStartPlayImmersive}
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            width: '100%',
-            height: '100%',
-            zIndex: 999,
-            background: 'rgba(10, 10, 12, 0.85)',
-            backdropFilter: 'blur(12px)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: 'pointer',
-            transition: 'all 0.3s ease'
-          }}
-        >
-          <div className="immersive-play-button">
-            <i className="fa-solid fa-circle-play"></i>
-          </div>
-          <span className="immersive-play-text">
-            {localStorage.getItem('yt_translator_default_lang') === 'Sinhala' 
-              ? (isShort ? 'පූර්ණ තිරයෙන් නරඹන්න (Play in Portrait Full Screen)' : 'හරස් අතට හරවා පූර්ණ තිරයෙන් නරඹන්න (Play in Landscape Full Screen)')
-              : (isShort ? 'Watch in Full Screen' : 'Watch in Landscape Full Screen')}
-          </span>
+      {/* Premium floating glassmorphic status tag for subtitle loading progress */}
+      {subtitlesLoading && (
+        <div className="premium-floating-status">
+          <div className="loading-spinner-tiny"></div>
+          <span>Subtitles preparing... ⏳</span>
         </div>
       )}
 
-      {/* Custom premium floating subtitle overlay */}
+      {/* Floating Subtitle Overlay */}
       {activeSubtitleText && (
         <div className="player-subtitle-overlay">
           <span className="player-subtitle-text">{activeSubtitleText}</span>

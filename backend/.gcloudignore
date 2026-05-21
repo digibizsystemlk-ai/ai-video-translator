@@ -1,0 +1,9 @@
+# Ignore common developer paths
+node_modules/
+.env
+temp/
+translation_cache.json
+feedbacks.json
+
+# Explicitly allow cookies.json to be deployed securely
+!cookies.json

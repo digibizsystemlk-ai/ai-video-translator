@@ -3,3 +3,4 @@ node_modules/
 temp/
 translation_cache.json
 feedbacks.json
+cookies.json
